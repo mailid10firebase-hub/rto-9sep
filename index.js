@@ -2,6 +2,8 @@
 import express from "express";
 import admin from "firebase-admin";
 import https from "https";
+import dotenv from "dotenv";
+dotenv.config();
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -16,12 +18,10 @@ let serviceAccountRaw = null;
 
 try {
   if (process.env.SERVICE_ACCOUNT_KEY_B64) {
-    // Preferred: base64 encoded JSON to avoid newline escaping on platforms like Render
     const decoded = Buffer.from(process.env.SERVICE_ACCOUNT_KEY_B64, "base64").toString("utf8");
     serviceAccountRaw = JSON.parse(decoded);
     console.log("✅ Loaded service account from SERVICE_ACCOUNT_KEY_B64");
   } else {
-    // Fallback: raw JSON string (may contain escaped \\n)
     serviceAccountRaw = JSON.parse(process.env.SERVICE_ACCOUNT_KEY);
     console.log("✅ Loaded service account from SERVICE_ACCOUNT_KEY");
   }
@@ -30,26 +30,21 @@ try {
   process.exit(1);
 }
 
-// Defensive: ensure private_key has real newlines
+// Ensure private_key newlines are real
 if (serviceAccountRaw && serviceAccountRaw.private_key) {
-  // Replace literal backslash-n sequences with real newlines (common render/host escaping issue)
   serviceAccountRaw.private_key = serviceAccountRaw.private_key.replace(/\\n/g, "\n");
 } else {
   console.error("❌ serviceAccount JSON missing private_key");
   process.exit(1);
 }
 
-// Sanity check (non-sensitive): show whether private_key starts correctly
 if (typeof serviceAccountRaw.private_key !== "string" || !serviceAccountRaw.private_key.includes("BEGIN PRIVATE KEY")) {
   console.error("❌ private_key doesn't contain BEGIN marker — PEM invalid");
   process.exit(1);
 }
 
-// Optional safe preview for debugging (shows first chars, with newlines escaped for readability)
 const preview = serviceAccountRaw.private_key.slice(0, 40).replace(/\n/g, "\\n");
 console.log("private_key preview (escaped):", preview);
-
-// --- ADDED: project_id + proxy logs (short) ---
 console.log("project_id:", serviceAccountRaw.project_id);
 console.log("HTTP_PROXY:", process.env.HTTP_PROXY);
 console.log("HTTPS_PROXY:", process.env.HTTPS_PROXY);
@@ -66,6 +61,18 @@ try {
   process.exit(1);
 }
 
+// Quick debug to see what messaging methods exist
+try {
+  const messaging = admin.messaging();
+  console.log("messaging methods:", {
+    hasSendMulticast: typeof messaging.sendMulticast === "function",
+    hasSendAll: typeof messaging.sendAll === "function",
+    hasSend: typeof messaging.send === "function",
+  });
+} catch (e) {
+  console.warn("Could not introspect admin.messaging():", e?.message || e);
+}
+
 // --- debug endpoint to test reachability to FCM endpoint ---
 app.get("/_debug_fcm_reach", (req, res) => {
   const url = `https://fcm.googleapis.com/v1/projects/${serviceAccountRaw.project_id}/messages:send`;
@@ -77,6 +84,58 @@ app.get("/_debug_fcm_reach", (req, res) => {
     })
     .on("error", (e) => res.status(500).json({ err: e.message }));
 });
+
+// --- util: send one batch with multiple fallback strategies ---
+async function sendBatchWithFallback(batchTokens) {
+  const messaging = admin.messaging();
+
+  // message template used for sendMulticast (tokens array) or per-token/sendAll
+  const multicastMessage = {
+    tokens: batchTokens,
+    data: { action: "start_core_service" },
+    android: {
+      priority: "high",
+      ttl: 60 * 1000 // 1 minute in ms
+    },
+  };
+
+  // If sendMulticast exists, prefer that (gives per-target responses)
+  if (typeof messaging.sendMulticast === "function") {
+    return messaging.sendMulticast(multicastMessage);
+  }
+
+  // If sendAll exists, convert to array of messages and call sendAll
+  if (typeof messaging.sendAll === "function") {
+    const messages = batchTokens.map(token => ({
+      token,
+      data: { action: "start_core_service" },
+      android: { priority: "high", ttl: 60 * 1000 }
+    }));
+    // sendAll returns {responses: [...], successCount, failureCount}
+    return messaging.sendAll(messages);
+  }
+
+  // Fallback: call send() per token and aggregate results
+  const promises = batchTokens.map(token =>
+    messaging.send({
+      token,
+      data: { action: "start_core_service" },
+      android: { priority: "high", ttl: 60 * 1000 }
+    }).then(r => ({ success: true, result: r }))
+      .catch(e => ({ success: false, error: e }))
+  );
+
+  const settled = await Promise.all(promises);
+  // Normalize to an object shaped similar to sendMulticast/sendAll
+  const responses = settled.map(s => {
+    if (s.success) return { success: true };
+    // make error message string
+    return { success: false, error: (s.error && s.error.message) ? s.error.message : String(s.error) };
+  });
+  const successCount = responses.filter(r => r.success).length;
+  const failureCount = responses.length - successCount;
+  return { responses, successCount, failureCount };
+}
 
 // --- routes ---
 app.get("/", (req, res) => {
@@ -113,25 +172,23 @@ app.post("/send-force-online", async (req, res) => {
 
     const summary = [];
     for (const batch of batches) {
-      const message = {
-        tokens: batch,
-        data: { action: "start_core_service" },
-        android: {
-          priority: "high",
-          ttl: 60 * 1000 // 1 minute
-        }
-      };
-
-      // --- ADDED: detailed try/catch around sendMulticast ---
       let resp;
       try {
-        resp = await admin.messaging().sendMulticast(message);
+        resp = await sendBatchWithFallback(batch);
       } catch (err) {
-        try {
-          console.error("sendMulticast ERR (ownProps):", Object.getOwnPropertyNames(err).reduce((acc, k) => { acc[k] = err[k]; return acc; }, {}));
-        } catch (e) {
-          console.error("sendMulticast ERR (unable to serialize err)", e);
-        }
+        // Try to log serializable parts of error
+        console.error("sendBatch ERR (ownProps):", (() => {
+          try {
+            const names = Object.getOwnPropertyNames(err || {}).reduce((acc, k) => {
+              acc[k] = err[k];
+              return acc;
+            }, {});
+            return names;
+          } catch (e) {
+            return { err: "unable to serialize error" };
+          }
+        })());
+        // If axios-like response exists
         if (err && err.response) {
           try {
             console.error("err.response.status:", err.response.status);
@@ -139,27 +196,35 @@ app.post("/send-force-online", async (req, res) => {
             console.error("err.response.data snippet:", data.slice(0, 1000));
           } catch (e) {}
         }
-        // rethrow to be caught by outer catch and return 500
-        throw err;
+        // Return 500 to caller with error message
+        console.error("🔥 Error sending batch:", err?.stack || err?.message || err);
+        return res.status(500).json({ success: false, error: err?.message || "send_error" });
       }
 
-      const mapped = resp.responses.map((r, idx) => ({
-        success: !!r.success,
-        error: r.error ? r.error.message : null,
-        index: idx
-      }));
+      // Normalize different response shapes (sendMulticast/sendAll/fallback)
+      // Both sendMulticast and sendAll return .responses array and successCount/failureCount
+      const responsesArray = Array.isArray(resp.responses) ? resp.responses : (resp?.responses ? resp.responses : []);
+      const successCount = typeof resp.successCount === "number" ? resp.successCount : (responsesArray.filter(r => r.success).length || 0);
+      const failureCount = typeof resp.failureCount === "number" ? resp.failureCount : (responsesArray.length - successCount);
 
-      console.log(
-        `✅ Batch sent size=${batch.length}, success=${resp.successCount}, fail=${resp.failureCount}`
-      );
-      if (resp.failureCount > 0) {
-        console.warn("❌ Failures:", mapped.filter(m => !m.success));
+      const mapped = (responsesArray.length > 0)
+        ? responsesArray.map((r, idx) => ({
+            success: !!r.success,
+            error: r.error ? (r.error.message || String(r.error)) : null,
+            index: idx
+          }))
+        : batch.map((_, idx) => ({ success: null, error: "no per-target info", index: idx }));
+
+      console.log(`✅ Batch sent size=${batch.length}, success=${successCount}, fail=${failureCount}`);
+      if (failureCount > 0) {
+        const fails = mapped.filter(m => !m.success);
+        console.warn("❌ Failures:", fails.slice(0, 10));
       }
 
       summary.push({
         batchSize: batch.length,
-        successCount: resp.successCount,
-        failureCount: resp.failureCount,
+        successCount,
+        failureCount,
         details: mapped
       });
     }
