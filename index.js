@@ -13,9 +13,8 @@ if (!process.env.SERVICE_ACCOUNT_KEY) {
 
 let serviceAccount;
 try {
-  // Replace escaped newlines (\n) with actual newlines
-  const fixedKey = process.env.SERVICE_ACCOUNT_KEY.replace(/\\n/g, "\n");
-  serviceAccount = JSON.parse(fixedKey);
+  // Parse SERVICE_ACCOUNT_KEY directly (no automatic \\n -> \n replacement)
+  serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_KEY);
 } catch (e) {
   console.error("❌ Failed to parse SERVICE_ACCOUNT_KEY as JSON:", e.message);
   process.exit(1);
