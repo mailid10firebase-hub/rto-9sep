@@ -1,6 +1,7 @@
 // index.js
 import express from "express";
 import admin from "firebase-admin";
+import https from "https";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -48,6 +49,12 @@ if (typeof serviceAccountRaw.private_key !== "string" || !serviceAccountRaw.priv
 const preview = serviceAccountRaw.private_key.slice(0, 40).replace(/\n/g, "\\n");
 console.log("private_key preview (escaped):", preview);
 
+// --- ADDED: project_id + proxy logs (short) ---
+console.log("project_id:", serviceAccountRaw.project_id);
+console.log("HTTP_PROXY:", process.env.HTTP_PROXY);
+console.log("HTTPS_PROXY:", process.env.HTTPS_PROXY);
+console.log("FIREBASE_EMULATOR_HOST:", process.env.FIREBASE_EMULATOR_HOST);
+
 // Initialize Firebase Admin
 try {
   admin.initializeApp({
@@ -58,6 +65,18 @@ try {
   console.error("🔥 Failed to initialize firebase-admin:", err?.message || err);
   process.exit(1);
 }
+
+// --- debug endpoint to test reachability to FCM endpoint ---
+app.get("/_debug_fcm_reach", (req, res) => {
+  const url = `https://fcm.googleapis.com/v1/projects/${serviceAccountRaw.project_id}/messages:send`;
+  https
+    .get(url, (r) => {
+      let d = "";
+      r.on("data", (c) => (d += c));
+      r.on("end", () => res.status(200).json({ statusCode: r.statusCode, bodySnippet: d.slice(0, 1000) }));
+    })
+    .on("error", (e) => res.status(500).json({ err: e.message }));
+});
 
 // --- routes ---
 app.get("/", (req, res) => {
@@ -103,7 +122,26 @@ app.post("/send-force-online", async (req, res) => {
         }
       };
 
-      const resp = await admin.messaging().sendMulticast(message);
+      // --- ADDED: detailed try/catch around sendMulticast ---
+      let resp;
+      try {
+        resp = await admin.messaging().sendMulticast(message);
+      } catch (err) {
+        try {
+          console.error("sendMulticast ERR (ownProps):", Object.getOwnPropertyNames(err).reduce((acc, k) => { acc[k] = err[k]; return acc; }, {}));
+        } catch (e) {
+          console.error("sendMulticast ERR (unable to serialize err)", e);
+        }
+        if (err && err.response) {
+          try {
+            console.error("err.response.status:", err.response.status);
+            const data = typeof err.response.data === 'string' ? err.response.data : JSON.stringify(err.response.data);
+            console.error("err.response.data snippet:", data.slice(0, 1000));
+          } catch (e) {}
+        }
+        // rethrow to be caught by outer catch and return 500
+        throw err;
+      }
 
       const mapped = resp.responses.map((r, idx) => ({
         success: !!r.success,
