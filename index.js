@@ -1,4 +1,4 @@
-// index.js
+// index.js (updated)
 import express from "express";
 import admin from "firebase-admin";
 import https from "https";
@@ -73,23 +73,55 @@ try {
   console.warn("Could not introspect admin.messaging():", e?.message || e);
 }
 
-// --- debug endpoint to test reachability to FCM endpoint ---
-app.get("/_debug_fcm_reach", (req, res) => {
-  const url = `https://fcm.googleapis.com/v1/projects/${serviceAccountRaw.project_id}/messages:send`;
-  https
-    .get(url, (r) => {
-      let d = "";
-      r.on("data", (c) => (d += c));
-      r.on("end", () => res.status(200).json({ statusCode: r.statusCode, bodySnippet: d.slice(0, 1000) }));
-    })
-    .on("error", (e) => res.status(500).json({ err: e.message }));
-});
+// --- helper: sanitize incoming tokens and keep original indices ---
+function sanitizeTokens(rawTokens) {
+  const cleaned = [];
+  const seen = new Set();
+  const removed = [];
+
+  rawTokens.forEach((t, origIdx) => {
+    if (typeof t !== "string") {
+      removed.push({ origIdx, reason: "not-a-string", raw: t });
+      return;
+    }
+    let s = t.trim();
+    // remove obvious garbage tokens
+    if (!s || /^(unavailable|null|undefined)$/i.test(s)) {
+      removed.push({ origIdx, reason: "unavailable-or-empty", raw: s });
+      return;
+    }
+    // skip extremely short strings (very likely truncated)
+    if (s.length < 20) {
+      removed.push({ origIdx, reason: "too-short", raw: s });
+      return;
+    }
+    // dedupe
+    if (seen.has(s)) {
+      removed.push({ origIdx, reason: "duplicate", raw: s });
+      return;
+    }
+    seen.add(s);
+    cleaned.push({ token: s, origIdx });
+  });
+
+  return { cleaned, removed };
+}
+
+function maskTokenSnippet(tok) {
+  try {
+    const s = String(tok);
+    if (s.length <= 14) return s;
+    return s.slice(0, 8) + "..." + s.slice(-6);
+  } catch (e) {
+    return "token_snippet_error";
+  }
+}
 
 // --- util: send one batch with multiple fallback strategies ---
+// returns object: { responses: [...], successCount, failureCount }
 async function sendBatchWithFallback(batchTokens) {
   const messaging = admin.messaging();
 
-  // message template used for sendMulticast (tokens array) or per-token/sendAll
   const multicastMessage = {
     tokens: batchTokens,
     data: { action: "start_core_service" },
@@ -99,23 +131,20 @@ async function sendBatchWithFallback(batchTokens) {
     },
   };
 
-  // If sendMulticast exists, prefer that (gives per-target responses)
   if (typeof messaging.sendMulticast === "function") {
     return messaging.sendMulticast(multicastMessage);
   }
 
-  // If sendAll exists, convert to array of messages and call sendAll
   if (typeof messaging.sendAll === "function") {
     const messages = batchTokens.map(token => ({
       token,
       data: { action: "start_core_service" },
       android: { priority: "high", ttl: 60 * 1000 }
     }));
-    // sendAll returns {responses: [...], successCount, failureCount}
     return messaging.sendAll(messages);
   }
 
-  // Fallback: call send() per token and aggregate results
+  // fallback: per-token send
   const promises = batchTokens.map(token =>
     messaging.send({
       token,
@@ -126,11 +155,9 @@ async function sendBatchWithFallback(batchTokens) {
   );
 
   const settled = await Promise.all(promises);
-  // Normalize to an object shaped similar to sendMulticast/sendAll
   const responses = settled.map(s => {
     if (s.success) return { success: true };
-    // make error message string
-    return { success: false, error: (s.error && s.error.message) ? s.error.message : String(s.error) };
+    return { success: false, error: (s.error && (s.error.message || s.error.code)) ? (s.error.message || s.error.code) : String(s.error) };
   });
   const successCount = responses.filter(r => r.success).length;
   const failureCount = responses.length - successCount;
@@ -142,42 +169,68 @@ app.get("/", (req, res) => {
   res.send("FCM Backend is running ✅");
 });
 
+app.get("/_debug_fcm_reach", (req, res) => {
+  const url = `https://fcm.googleapis.com/v1/projects/${serviceAccountRaw.project_id}/messages:send`;
+  https
+    .get(url, (r) => {
+      let d = "";
+      r.on("data", (c) => (d += c));
+      r.on("end", () => res.status(200).json({ statusCode: r.statusCode, bodySnippet: d.slice(0, 1000) }));
+    })
+    .on("error", (e) => res.status(500).json({ err: e.message }));
+});
+
 app.post("/send-force-online", async (req, res) => {
   try {
     const bodyPreview = JSON.stringify(req.body, null, 0).slice(0, 2000);
     console.log("Incoming /send-force-online body:", bodyPreview);
 
     const body = req.body || {};
-    let tokens = Array.isArray(body.tokens)
+    let tokensRaw = Array.isArray(body.tokens)
       ? body.tokens
       : Array.isArray(body.registration_ids)
       ? body.registration_ids
       : null;
 
-    if (!tokens || tokens.length === 0) {
+    if (!tokensRaw || tokensRaw.length === 0) {
       console.warn("⚠️ No tokens provided or invalid format.");
       return res
         .status(400)
         .json({ success: false, error: "No tokens provided or invalid format" });
     }
 
-    console.log(`📨 Preparing to send to ${tokens.length} tokens.`);
+    // sanitize tokens and keep original indices
+    const { cleaned, removed } = sanitizeTokens(tokensRaw);
+    console.log(`Token sanitize: kept=${cleaned.length}, removed=${removed.length}`);
+    if (removed.length > 0) {
+      console.warn("Sample removed tokens:", removed.slice(0, 10));
+    }
+
+    if (cleaned.length === 0) {
+      return res.status(400).json({ success: false, error: "All tokens were invalid after sanitize", removed });
+    }
+
+    // prepare array of raw token strings for sending and a mapping to original indices
+    const cleanedTokens = cleaned.map(c => c.token);
+    const origIndexMap = cleaned.map(c => c.origIdx); // cleanedTokens[i] -> origIndexMap[i]
 
     // Batch into <=500 tokens
     const MAX = 500;
     const batches = [];
-    for (let i = 0; i < tokens.length; i += MAX) {
-      batches.push(tokens.slice(i, i + MAX));
+    for (let i = 0; i < cleanedTokens.length; i += MAX) {
+      batches.push({
+        tokens: cleanedTokens.slice(i, i + MAX),
+        startIndex: i
+      });
     }
 
     const summary = [];
     for (const batch of batches) {
       let resp;
       try {
-        resp = await sendBatchWithFallback(batch);
+        resp = await sendBatchWithFallback(batch.tokens);
       } catch (err) {
-        // Try to log serializable parts of error
-        console.error("sendBatch ERR (ownProps):", (() => {
+        console.error("sendBatch ERR (serializable props):", (() => {
           try {
             const names = Object.getOwnPropertyNames(err || {}).reduce((acc, k) => {
               acc[k] = err[k];
@@ -188,7 +241,7 @@ app.post("/send-force-online", async (req, res) => {
             return { err: "unable to serialize error" };
           }
         })());
-        // If axios-like response exists
+
         if (err && err.response) {
           try {
             console.error("err.response.status:", err.response.status);
@@ -196,40 +249,76 @@ app.post("/send-force-online", async (req, res) => {
             console.error("err.response.data snippet:", data.slice(0, 1000));
           } catch (e) {}
         }
-        // Return 500 to caller with error message
+
         console.error("🔥 Error sending batch:", err?.stack || err?.message || err);
         return res.status(500).json({ success: false, error: err?.message || "send_error" });
       }
 
-      // Normalize different response shapes (sendMulticast/sendAll/fallback)
-      // Both sendMulticast and sendAll return .responses array and successCount/failureCount
+      // Normalize response to get per-target results
       const responsesArray = Array.isArray(resp.responses) ? resp.responses : (resp?.responses ? resp.responses : []);
       const successCount = typeof resp.successCount === "number" ? resp.successCount : (responsesArray.filter(r => r.success).length || 0);
       const failureCount = typeof resp.failureCount === "number" ? resp.failureCount : (responsesArray.length - successCount);
 
+      // Map responses back to original request indices and token snippets
       const mapped = (responsesArray.length > 0)
-        ? responsesArray.map((r, idx) => ({
-            success: !!r.success,
-            error: r.error ? (r.error.message || String(r.error)) : null,
-            index: idx
-          }))
-        : batch.map((_, idx) => ({ success: null, error: "no per-target info", index: idx }));
+        ? responsesArray.map((r, idx) => {
+            const globalCleanedIndex = batch.startIndex + idx;
+            const originalIndex = origIndexMap[globalCleanedIndex];
+            const token = batch.tokens[idx];
+            const tokenSnippet = maskTokenSnippet(token);
+            // extract error message safely
+            let errorMsg = null;
+            if (r.error) {
+              if (typeof r.error === "string") errorMsg = r.error;
+              else if (r.error.message) errorMsg = r.error.message;
+              else if (r.error.code) errorMsg = r.error.code;
+              else errorMsg = JSON.stringify(r.error);
+            }
+            return {
+              success: !!r.success,
+              error: errorMsg,
+              indexInBatch: idx,
+              cleanedIndex: globalCleanedIndex,
+              originalIndex,
+              tokenSnippet
+            };
+          })
+        : batch.tokens.map((tok, idx) => {
+            const globalCleanedIndex = batch.startIndex + idx;
+            const originalIndex = origIndexMap[globalCleanedIndex];
+            return {
+              success: null,
+              error: "no per-target info",
+              indexInBatch: idx,
+              cleanedIndex: globalCleanedIndex,
+              originalIndex,
+              tokenSnippet: maskTokenSnippet(tok)
+            };
+          });
 
-      console.log(`✅ Batch sent size=${batch.length}, success=${successCount}, fail=${failureCount}`);
+      console.log(`✅ Batch sent size=${batch.tokens.length}, success=${successCount}, fail=${failureCount}`);
       if (failureCount > 0) {
         const fails = mapped.filter(m => !m.success);
-        console.warn("❌ Failures:", fails.slice(0, 10));
+        console.warn("❌ Failures (sample up to 10):", fails.slice(0, 10));
       }
 
       summary.push({
-        batchSize: batch.length,
+        batchSize: batch.tokens.length,
         successCount,
         failureCount,
         details: mapped
       });
     }
 
-    return res.json({ success: true, batches: summary });
+    // Return sanitized removed tokens info + per-batch details
+    return res.json({
+      success: true,
+      originalTotal: tokensRaw.length,
+      sanitizedKept: cleanedTokens.length,
+      sanitizedRemovedCount: removed.length,
+      sanitizedRemovedSample: removed.slice(0, 20),
+      batches: summary
+    });
   } catch (err) {
     console.error("🔥 Error in /send-force-online:", err?.stack || err?.message || err);
     return res
